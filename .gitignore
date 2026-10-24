@@ -1,0 +1,14 @@
+# 下载的资源文件
+jpg/
+pdf/
+
+# 浏览器持久化配置（含会话 Cookie，勿上传）
+chrome_profile/
+
+# Python
+__pycache__/
+*.pyc
+
+# 运行日志与临时文件
+*.log
+req*.json
