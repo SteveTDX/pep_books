@@ -40,9 +40,10 @@ from browser import create_driver
 JC_URL = "https://jc.pep.com.cn/"
 PROFILE_DIR = Path(__file__).resolve().parent / "chrome_profile"
 
-CLICK_MIN_S = 1.2      # 翻页点击间隔下限（秒）
-CLICK_MAX_S = 2.8      # 翻页点击间隔上限（秒），实际取随机值抖动
+CLICK_MIN_S = 1.5      # 翻页点击间隔下限（秒）
+CLICK_MAX_S = 3.5      # 翻页点击间隔上限（秒），实际取随机值抖动
 PAGE_WAIT_S = 8        # 点击翻页后等待页码变化的最长时间
+NEW_PAGE_WAIT_S = 25   # 翻页后等待新页图片加载并提取到手的最长时间
 VERIFY_TIMEOUT_S = 300  # 等待用户完成滑块验证的最长时间（秒）
 
 _INVALID_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]')
@@ -224,8 +225,8 @@ _EXTRACT_JS = """const cb = arguments[arguments.length - 1];
     const out = [];
     const imgs = [...document.querySelectorAll('img')].filter(
         e => e.src.includes('/files/mobile/'));
-    // 等图片加载完成（最多约 3 秒）
-    for (let t = 0; t < 30; t++) {
+    // 等图片加载完成（最多约 8 秒）
+    for (let t = 0; t < 80; t++) {
         if (imgs.every(e => e.complete)) break;
         await new Promise(r => setTimeout(r, 100));
     }
@@ -278,6 +279,26 @@ _NEXT_SELECTORS = [
     ".nextBtn", ".btn-next", ".next-btn", ".flip_button_right",
     "[class*='next' i]",
 ]
+
+
+_SPREAD_READY_JS = """const cur = arguments[0];
+for (const e of document.querySelectorAll('img')) {
+    const m = (e.src || '').match(/\\/files\\/mobile\\/(\\d+)\\.jpg/);
+    if (m && +m[1] >= cur && e.complete && e.naturalWidth > 0) return true;
+}
+return false;"""
+
+
+def _spread_ready(driver, cur: int) -> bool:
+    """当前跨页（从第 cur 页起）的页面图片是否已加载完成。
+
+    用于区分“正常翻页（图片在加载）”与“图片被限流（一直加载不出）”，
+    与该页是否已下载过无关，因此断点续传重翻已下载页时不会误判。
+    """
+    try:
+        return bool(driver.execute_script(_SPREAD_READY_JS, cur))
+    except Exception:
+        return False
 
 
 def _flip_next(driver, cur: int, state: dict, log=print) -> bool:
@@ -410,8 +431,8 @@ def download_book(title: str, href: str, jpg_root: Path,
                 break
 
             cur = _current_page(driver)
-            if cur >= total:      # 已到最后一页，稍等后把余图收完
-                time.sleep(1.5)
+            if cur >= total:      # 已到最后一页，把余图收完
+                time.sleep(2.0)
                 _bank()
                 break
 
@@ -426,12 +447,31 @@ def download_book(title: str, href: str, jpg_root: Path,
             # 控制点击速度：随机抖动间隔
             time.sleep(random.uniform(CLICK_MIN_S, CLICK_MAX_S))
 
+            # 翻页成功后确认新跨页图片加载完成（与是否已下载无关，
+            # 断点续传重翻已下载页时不受影响）；一直加载不出说明被限流，
+            # 继续翻页只会造成更多缺页，应立即终止保留断点
+            new_cur = _current_page(driver)
+            ready = False
+            deadline = time.time() + NEW_PAGE_WAIT_S
+            while time.time() < deadline:
+                if _spread_ready(driver, new_cur):
+                    ready = True
+                    break
+                time.sleep(1.0)
+            _bank()
+            if not ready and len(have) < total:
+                raise RuntimeError(
+                    f"第 {new_cur} 页图片无法加载（疑似触发反爬限流），"
+                    f"已获取 {len(have)}/{total} 页；请稍等几分钟后重新"
+                    "下载，已获取的页会自动续传")
+            time.sleep(1.5)   # 稍等补齐跨页的另一张
+            _bank()
+
         if len(have) < total or errors:
-            msg = f"仅获取 {len(have)}/{total} 页"
-            if errors:
-                msg += "；" + "；".join(errors[:2])
-                msg += "……" if len(errors) > 2 else ""
-            raise RuntimeError(msg)
+            hint = ("；" + "；".join(errors[:2])
+                    + ("……" if len(errors) > 2 else "")) if errors \
+                else "（疑似触发反爬限流，请稍后重试续传）"
+            raise RuntimeError(f"仅获取 {len(have)}/{total} 页{hint}")
         return folder
     finally:
         try:

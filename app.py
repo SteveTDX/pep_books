@@ -48,9 +48,23 @@ def _get_phase(title: str) -> str:
         return _progress.get(title, {}).get("phase")
 
 
+def _try_begin(title: str) -> bool:
+    """排队中的书开始下载前原子确认；已被取消（进度条目被删）则跳过。
+
+    与 /api/cancel 共用 _lock，保证“取消排队”与“开始下载”不产生竞态。
+    """
+    with _lock:
+        st = _progress.get(title)
+        if not st or st.get("phase") != "wait":
+            return False
+        st.update(phase="download", done=0, total=0, error=None)
+        return True
+
+
 def _task_download(title: str):
+    if not _try_begin(title):
+        return  # 排队中被取消，直接跳过
     try:
-        _set(title, phase="download", done=0, total=0, error=None)
         download_book(
             title, BOOKS[title], JPG_DIR,
             on_progress=lambda d, t: _set(title, phase="download",
@@ -126,6 +140,25 @@ def api_download():
 
     threading.Thread(target=_run_job, args=(titles,), daemon=True).start()
     return jsonify({"started": True, "count": len(titles)})
+
+
+@app.post("/api/cancel")
+def api_cancel():
+    """取消仍在排队（尚未开始下载）的书目。
+
+    下载中/合成中/已完成的书不可取消；取消后前端该行恢复未选中状态。
+    """
+    data = request.get_json(silent=True) or {}
+    canceled = []
+    with _lock:
+        for t in data.get("titles", []):
+            st = _progress.get(t)
+            if st and st.get("phase") == "wait":
+                del _progress[t]
+                canceled.append(t)
+    if canceled:
+        print(f"[download] 取消排队：{canceled}", flush=True)
+    return jsonify({"canceled": canceled})
 
 
 @app.get("/api/progress")
