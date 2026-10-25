@@ -23,12 +23,14 @@
   （chrome_profile/）会记住验证信任状态。
 """
 
+import atexit
 import base64
 import random
 import re
 import shutil
 import time
 from pathlib import Path
+from threading import Lock
 from urllib.parse import urljoin
 
 from selenium.webdriver.common.action_chains import ActionChains
@@ -45,6 +47,16 @@ CLICK_MAX_S = 3.5      # 翻页点击间隔上限（秒），实际取随机值�
 PAGE_WAIT_S = 8        # 点击翻页后等待页码变化的最长时间
 NEW_PAGE_WAIT_S = 25   # 翻页后等待新页图片加载并提取到手的最长时间
 VERIFY_TIMEOUT_S = 300  # 等待用户完成滑块验证的最长时间（秒）
+VERIFY_MAX_PER_JOB = 2  # 单次任务允许的人工滑块验证次数上限
+
+# 验证成功后仍反复出新挑战（u_atoken/u_asession 每次不同）说明本机 IP
+# 已被 WAF 临时限流（严格模式），此时继续滑动无意义，直接终止并提示等待
+_verify_stats = {"n": 0}
+
+
+def reset_verify_stats():
+    """每次下载任务开始时重置验证计数（由 app 在任务启动时调用）。"""
+    _verify_stats["n"] = 0
 
 _INVALID_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]')
 
@@ -141,6 +153,60 @@ def _default_log(msg):
     print(msg, flush=True)
 
 
+# ---------------- 共享浏览器会话 ----------------
+# 全程只使用一个长驻浏览器会话（下载串行）：滑块验证通过的信任
+# 与会话绑定，换进程即失效；共用会话可保证验证一次后不再反复弹窗。
+
+_session_lock = Lock()
+_session = {"driver": None, "headless": True}
+
+
+def _alive(driver) -> bool:
+    try:
+        _ = driver.current_url
+        return True
+    except Exception:
+        return False
+
+
+def _get_session(headless: bool = True, log=_default_log):
+    """获取共享会话；不存在则创建。返回 (driver, 是否无头)。"""
+    with _session_lock:
+        if _session["driver"] is None or not _alive(_session["driver"]):
+            _session["driver"] = _launch_with_profile(headless, log=log)
+            _session["headless"] = headless
+        return _session["driver"], _session["headless"]
+
+
+def _reset_session(headless: bool, log=_default_log):
+    """关闭并用指定模式重建共享会话（滑块验证需切换有头时用）。"""
+    with _session_lock:
+        old = _session["driver"]
+        _session["driver"] = None
+        if old is not None:
+            try:
+                old.quit()
+            except Exception:
+                pass
+        _session["driver"] = _launch_with_profile(headless, log=log)
+        _session["headless"] = headless
+        return _session["driver"]
+
+
+def _close_session():
+    with _session_lock:
+        old = _session["driver"]
+        _session["driver"] = None
+    if old is not None:
+        try:
+            old.quit()
+        except Exception:
+            pass
+
+
+atexit.register(_close_session)
+
+
 def _launch_with_profile(headless: bool, window=(1366, 900), log=_default_log):
     """用持久化配置启动浏览器；配置被占用/损坏时自动重置并重试一次。
 
@@ -182,42 +248,47 @@ def _goto_reader(driver, base: str, mobile: str):
         driver.execute_script(_ANCHOR_JS, mobile)
 
 
-def _open_reader(base: str, mobile: str, headless: bool, log=print):
-    """打开阅读器；遇到滑块验证则换有头窗口由用户滑动后继续。
+def _open_reader(base: str, mobile: str, headless: bool,
+                 log=_default_log):
+    """用共享会话打开阅读器；遇到滑块验证由用户滑动一次后继续。
 
-    返回已通过验证、处于阅读器页面的驱动。
+    共享会话保证验证只需一次：无头会话被拦时切换为有头（同一持久化
+    配置），用户滑动通过后该会话保留给后续所有书目复用，不会每本书
+    都重新弹验证；若当前已是有头会话仍被拦，就在当前窗口内等待用户
+    完成，不新弹窗口。
     """
-    driver = _launch_with_profile(headless, log=log)
-    try:
-        _goto_reader(driver, base, mobile)
-        if _wait_input(driver, 15):
-            return driver
-        if not _is_challenge(driver):
-            raise RuntimeError("阅读页加载超时，未出现页码输入框")
-
-        # 无头会话被拦：换有头窗口（同一持久化配置）请用户滑一次
-        log(">>> 检测到滑块验证：切换到可见浏览器窗口，请手动完成验证 "
-            f"（{VERIFY_TIMEOUT_S // 60} 分钟内）……")
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        _notify_verify(True)
-        driver = _launch_with_profile(False, window=(1280, 860), log=log)
-        try:
-            _goto_reader(driver, base, mobile)
-            if not _wait_input(driver, VERIFY_TIMEOUT_S):
-                raise RuntimeError("滑块验证未完成（超时或窗口被关闭）")
-        finally:
-            _notify_verify(False)
-        log(">>> 验证通过，用当前窗口继续翻页下载")
+    driver, was_headless = _get_session(headless, log=log)
+    _goto_reader(driver, base, mobile)
+    if _wait_input(driver, 15):
         return driver
-    except Exception:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        raise
+    if not _is_challenge(driver):
+        raise RuntimeError("阅读页加载超时，未出现页码输入框")
+
+    # 验证循环保护：短时间内反复要求滑块验证（且每次通过后令牌都变）
+    # 说明 IP 已被临时限流，继续验证无意义
+    if _verify_stats["n"] >= VERIFY_MAX_PER_JOB:
+        raise RuntimeError(
+            "滑块验证通过后仍被反复拦截：本机 IP 已被网站临时限流，"
+            "请等待约 30~60 分钟或更换网络后再重新下载"
+            "（已下载的页会自动续传）")
+    _verify_stats["n"] += 1
+
+    _notify_verify(True)
+    try:
+        if was_headless:
+            log(">>> 检测到滑块验证：切换到可见浏览器窗口，请手动完成验证"
+                f"（{VERIFY_TIMEOUT_S // 60} 分钟内）；通过一次后后续书目"
+                "共用此会话，不会再弹验证")
+            driver = _reset_session(False, log=log)
+            _goto_reader(driver, base, mobile)
+        else:
+            log(">>> 当前窗口出现滑块验证，请在同一窗口内完成")
+        if not _wait_input(driver, VERIFY_TIMEOUT_S):
+            raise RuntimeError("滑块验证未完成（超时或窗口被关闭）")
+    finally:
+        _notify_verify(False)
+    log(">>> 验证通过，继续翻页下载")
+    return driver
 
 
 _EXTRACT_JS = """const cb = arguments[arguments.length - 1];
@@ -394,87 +465,82 @@ def download_book(title: str, href: str, jpg_root: Path,
     folder.mkdir(parents=True, exist_ok=True)
 
     driver = _open_reader(base, mobile, headless, log=log)
-    try:
-        total = _read_total(driver, mobile)
-        log(f"[downloader] 《{title}》共 {total} 页，开始翻页下载")
+    # 共享会话：不在本书结束后关闭，保留给后续书目（见 _open_reader）
+    total = _read_total(driver, mobile)
+    log(f"[downloader] 《{title}》共 {total} 页，开始翻页下载")
 
-        # 清理无效残留（如被拦截时误存的网页），再统计已有页（断点续传）
-        for f in folder.glob("*.jpg"):
-            if f.stem.isdigit() and not _is_valid_jpg(f):
-                f.unlink()
-        have = {int(f.stem) for f in folder.glob("*.jpg")
-                if f.stem.isdigit() and _is_valid_jpg(f)}
-        if on_progress:
-            on_progress(len(have), total)
+    # 清理无效残留（如被拦截时误存的网页），再统计已有页（断点续传）
+    for f in folder.glob("*.jpg"):
+        if f.stem.isdigit() and not _is_valid_jpg(f):
+            f.unlink()
+    have = {int(f.stem) for f in folder.glob("*.jpg")
+            if f.stem.isdigit() and _is_valid_jpg(f)}
+    if on_progress:
+        on_progress(len(have), total)
 
-        errors: list = []
+    errors: list = []
 
-        def _bank():
-            """把阅读器当前已加载的页面图片全部存盘。"""
-            for n, data_url in sorted(_extract_images(driver).items()):
-                if n in have:
-                    continue
-                try:
-                    _write_data_url(data_url, folder / f"{n:03d}.jpg")
-                except Exception as exc:
-                    errors.append(f"第{n}页：{exc}")
-                    continue
-                have.add(n)
-                if on_progress:
-                    on_progress(len(have), total)
-
-        flip_state = {"idx": 0}
-        stall = 0
-        while len(have) < total:
-            _bank()
-            if len(have) >= total:
-                break
-
-            cur = _current_page(driver)
-            if cur >= total:      # 已到最后一页，把余图收完
-                time.sleep(2.0)
-                _bank()
-                break
-
-            if not _flip_next(driver, cur, flip_state, log=log):
-                stall += 1
-                if stall >= 3:
-                    raise RuntimeError(
-                        f"无法翻页（停在第 {cur} 页，已获取 "
-                        f"{len(have)}/{total} 页）")
+    def _bank():
+        """把阅读器当前已加载的页面图片全部存盘。"""
+        for n, data_url in sorted(_extract_images(driver).items()):
+            if n in have:
                 continue
-            stall = 0
-            # 控制点击速度：随机抖动间隔
-            time.sleep(random.uniform(CLICK_MIN_S, CLICK_MAX_S))
+            try:
+                _write_data_url(data_url, folder / f"{n:03d}.jpg")
+            except Exception as exc:
+                errors.append(f"第{n}页：{exc}")
+                continue
+            have.add(n)
+            if on_progress:
+                on_progress(len(have), total)
 
-            # 翻页成功后确认新跨页图片加载完成（与是否已下载无关，
-            # 断点续传重翻已下载页时不受影响）；一直加载不出说明被限流，
-            # 继续翻页只会造成更多缺页，应立即终止保留断点
-            new_cur = _current_page(driver)
-            ready = False
-            deadline = time.time() + NEW_PAGE_WAIT_S
-            while time.time() < deadline:
-                if _spread_ready(driver, new_cur):
-                    ready = True
-                    break
-                time.sleep(1.0)
+    flip_state = {"idx": 0}
+    stall = 0
+    while len(have) < total:
+        _bank()
+        if len(have) >= total:
+            break
+
+        cur = _current_page(driver)
+        if cur >= total:      # 已到最后一页，把余图收完
+            time.sleep(2.0)
             _bank()
-            if not ready and len(have) < total:
+            break
+
+        if not _flip_next(driver, cur, flip_state, log=log):
+            stall += 1
+            if stall >= 3:
                 raise RuntimeError(
-                    f"第 {new_cur} 页图片无法加载（疑似触发反爬限流），"
-                    f"已获取 {len(have)}/{total} 页；请稍等几分钟后重新"
-                    "下载，已获取的页会自动续传")
-            time.sleep(1.5)   # 稍等补齐跨页的另一张
-            _bank()
+                    f"无法翻页（停在第 {cur} 页，已获取 "
+                    f"{len(have)}/{total} 页）")
+            continue
+        stall = 0
+        # 控制点击速度：随机抖动间隔
+        time.sleep(random.uniform(CLICK_MIN_S, CLICK_MAX_S))
 
-        if len(have) < total or errors:
-            hint = ("；" + "；".join(errors[:2])
-                    + ("……" if len(errors) > 2 else "")) if errors \
-                else "（疑似触发反爬限流，请稍后重试续传）"
-            raise RuntimeError(f"仅获取 {len(have)}/{total} 页{hint}")
-        return folder
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        # 翻页成功后确认新跨页图片加载完成（与是否已下载无关，
+        # 断点续传重翻已下载页时不受影响）；一直加载不出说明被限流，
+        # 继续翻页只会造成更多缺页，应立即终止保留断点
+        new_cur = _current_page(driver)
+        ready = False
+        deadline = time.time() + NEW_PAGE_WAIT_S
+        while time.time() < deadline:
+            if _spread_ready(driver, new_cur):
+                ready = True
+                break
+            time.sleep(1.0)
+        _bank()
+        if not ready and len(have) < total:
+            raise RuntimeError(
+                f"第 {new_cur} 页图片无法加载（疑似触发反爬限流），"
+                f"已获取 {len(have)}/{total} 页；请稍等几分钟后重新"
+                "下载，已获取的页会自动续传")
+        time.sleep(1.5)   # 稍等补齐跨页的另一张
+        _bank()
+
+    if len(have) < total or errors:
+        hint = ("；" + "；".join(errors[:2])
+                + ("……" if len(errors) > 2 else "")) if errors \
+            else "（疑似触发反爬限流，请稍后重试续传）"
+        raise RuntimeError(f"仅获取 {len(have)}/{total} 页{hint}")
+    return folder

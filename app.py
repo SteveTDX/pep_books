@@ -13,7 +13,8 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
-from downloader import download_book, on_verify_event, sanitize
+from downloader import (download_book, on_verify_event, reset_verify_stats,
+                        sanitize)
 from pdf_maker import folder_to_pdf
 from scraper import CATEGORY_TEXT, fetch_book_list
 
@@ -98,6 +99,7 @@ def _run_job(titles):
     """
     pdf_pool = ThreadPoolExecutor(max_workers=PDF_WORKERS)
     pdf_futures = []
+    reset_verify_stats()   # 每次任务重置滑块验证计数（防验证循环）
     try:
         with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as dl_pool:
             futures = {dl_pool.submit(_task_download, t): t for t in titles}
