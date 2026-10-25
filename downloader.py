@@ -26,6 +26,7 @@
 import base64
 import random
 import re
+import shutil
 import time
 from pathlib import Path
 from urllib.parse import urljoin
@@ -135,6 +136,32 @@ _ANCHOR_JS = """
 """
 
 
+def _default_log(msg):
+    print(msg, flush=True)
+
+
+def _launch_with_profile(headless: bool, window=(1366, 900), log=_default_log):
+    """用持久化配置启动浏览器；配置被占用/损坏时自动重置并重试一次。
+
+    残留的浏览器进程锁死配置目录会导致 Chrome 启动崩溃
+    （DevToolsActivePort file doesn't exist），此时清空配置重建
+    即可恢复（代价是可能需要重新完成一次滑块验证）。
+    """
+    try:
+        return create_driver(headless=headless, window=window,
+                             user_data_dir=PROFILE_DIR, log=log)
+    except Exception as exc:
+        log(f"[downloader] 浏览器启动失败，重置持久化配置后重试："
+            f"{str(exc).splitlines()[0][:100]}")
+        shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+        if PROFILE_DIR.exists():
+            raise RuntimeError(
+                "chrome_profile 无法删除（仍被残留浏览器进程占用），"
+                "请在任务管理器结束残留的 chrome.exe 后重试")
+        return create_driver(headless=headless, window=window,
+                             user_data_dir=PROFILE_DIR, log=log)
+
+
 def _goto_reader(driver, base: str, mobile: str):
     """先打开 jc 首页，再通过 <a> 点击跳到书本页面（携带 Referer）。
 
@@ -159,8 +186,7 @@ def _open_reader(base: str, mobile: str, headless: bool, log=print):
 
     返回已通过验证、处于阅读器页面的驱动。
     """
-    driver = create_driver(headless=headless, user_data_dir=PROFILE_DIR,
-                           log=log)
+    driver = _launch_with_profile(headless, log=log)
     try:
         _goto_reader(driver, base, mobile)
         if _wait_input(driver, 15):
@@ -176,8 +202,7 @@ def _open_reader(base: str, mobile: str, headless: bool, log=print):
         except Exception:
             pass
         _notify_verify(True)
-        driver = create_driver(headless=False, window=(1280, 860),
-                               user_data_dir=PROFILE_DIR, log=log)
+        driver = _launch_with_profile(False, window=(1280, 860), log=log)
         try:
             _goto_reader(driver, base, mobile)
             if not _wait_input(driver, VERIFY_TIMEOUT_S):
@@ -336,7 +361,7 @@ def _is_valid_jpg(path: Path) -> bool:
 
 def download_book(title: str, href: str, jpg_root: Path,
                   on_progress=None, headless: bool = True,
-                  log=print) -> Path:
+                  log=_default_log) -> Path:
     """打开阅读器逐页翻页下载整本书的 jpg，返回图片目录。
 
     on_progress(已获取页数, 总页数) 每存下一页回调一次；

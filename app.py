@@ -8,7 +8,7 @@
 import argparse
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
@@ -22,7 +22,7 @@ JPG_DIR = BASE_DIR / "jpg"      # 每本书一个子文件夹，存放页面 jpg
 PDF_DIR = BASE_DIR / "pdf"      # 存放合成后的 PDF
 
 DOWNLOAD_WORKERS = 1            # 串行下载：共享持久化浏览器配置，降低触发反爬
-PDF_WORKERS = 2                 # 同时合成 PDF 的书本数
+PDF_WORKERS = 2                 # PDF 合成线程池（与下载队列并行）
 VISIBLE = False                 # --visible 时显示下载用的浏览器窗口
 
 app = Flask(__name__)
@@ -76,27 +76,31 @@ def _task_pdf(title: str):
 
 
 def _run_job(titles):
-    """后台任务：并行翻页下载全部 jpg → 全部下载完成后逐本合成 PDF。
+    """后台任务：jpg 下载队列与 PDF 合成队列并行（流水线）。
 
     每本书由独立浏览器打开阅读器，读取总页数后逐页点击“下一页”，
-    随机抖动间隔控制点击速度，逐页保存 jpg。
+    随机抖动间隔控制点击速度，逐页保存 jpg；某本书下载完成的瞬间
+    立即提交到 PDF 合成线程池，与后续书本的下载并行进行。
     """
+    pdf_pool = ThreadPoolExecutor(max_workers=PDF_WORKERS)
+    pdf_futures = []
     try:
-        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
-            for title in titles:
-                pool.submit(_task_download, title)
-
-        # 全部 jpg 下载完成后，逐本合成 PDF（界面绿条）
-        pdf_titles = [t for t in titles if _get_phase(t) == "downloaded"]
-        if pdf_titles:
-            with ThreadPoolExecutor(max_workers=PDF_WORKERS) as pool:
-                for title in pdf_titles:
-                    pool.submit(_task_pdf, title)
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as dl_pool:
+            futures = {dl_pool.submit(_task_download, t): t for t in titles}
+            for fut in as_completed(futures):
+                title = futures[fut]
+                if _get_phase(title) == "downloaded":
+                    # 下载完毕 → 立即加入 PDF 合成队列
+                    pdf_futures.append(pdf_pool.submit(_task_pdf, title))
+        # 下载队列全部结束后，等待尚在进行的 PDF 合成收尾
+        for fut in pdf_futures:
+            fut.result()
     except Exception as exc:
-        print(f"[download] 任务异常：{exc}")
+        print(f"[download] 任务异常：{exc}", flush=True)
     finally:
+        pdf_pool.shutdown(wait=True)
         _state["running"] = False
-        print("[download] 全部任务结束")
+        print("[download] 全部任务结束", flush=True)
 
 
 @app.get("/")

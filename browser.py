@@ -36,28 +36,40 @@ def _apply_stealth(opts, headless: bool, window, user_data_dir=None):
     opts.add_experimental_option("useAutomationExtension", False)
 
 
-def create_driver(headless: bool = True, window=(1366, 900), log=print,
+def _log(msg: str):
+    print(msg, flush=True)
+
+
+def create_driver(headless: bool = True, window=(1366, 900), log=_log,
                   user_data_dir=None):
     """创建带隐身处理的浏览器驱动：优先 Chrome，失败回退 Edge。
 
     Selenium Manager 会自动下载匹配的浏览器驱动。
+    指定了 user_data_dir 时不回退 Edge（两者的配置目录不通用），
+    由调用方决定是否重置配置后重试。
     """
     from selenium import webdriver
 
+    chrome_exc = None
     try:
         from selenium.webdriver.chrome.options import Options as ChromeOptions
         opts = ChromeOptions()
         _apply_stealth(opts, headless, window, user_data_dir)
         driver = webdriver.Chrome(options=opts)
     except Exception as exc:
-        log(f"[browser] Chrome 启动失败（{exc}），回退 Edge")
+        chrome_exc = exc
+        if user_data_dir:
+            raise RuntimeError(
+                f"Chrome 启动失败（配置目录可能被残留浏览器进程占用或损坏）："
+                f"{str(exc).splitlines()[0]}") from exc
+        log(f"[browser] Chrome 启动失败（{str(exc).splitlines()[0]}），回退 Edge")
         from selenium.webdriver.edge.options import Options as EdgeOptions
         opts = EdgeOptions()
         _apply_stealth(opts, headless, window, user_data_dir)
         driver = webdriver.Edge(options=opts)
 
     driver.set_page_load_timeout(60)
-    driver.set_script_timeout(120)   # execute_async_script 取图用
+    driver.set_script_timeout(120)   # execute_async_script 提取图片用
     try:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument", {"source": _STEALTH_JS})
